@@ -849,6 +849,14 @@ class FatalError(BinanceError):
     pass
 
 
+class BanError(FatalError):
+    """Binance banned/rate-limited this server IP for a long time (HTTP 418/429, long Retry-After)."""
+
+    def __init__(self, msg: str, wait: float) -> None:
+        super().__init__(msg)
+        self.wait = wait
+
+
 def parse_kline(r: Any) -> Optional[Row]:
     try:
         t, ct = int(r[0]), int(r[6])
@@ -899,6 +907,11 @@ class BinanceClient:
                     if r.status in (418, 429):
                         wait = float(r.headers.get("Retry-After", "30" if r.status == 429 else "120"))
                         self._cooldown_until = time.monotonic() + wait
+                        if wait > 900:  # do not sleep for hours: fail fast with a clear message
+                            until = fmt_ts(int((time.time() + wait) * 1000))
+                            raise BanError(f"Binance has banned this server's IP (HTTP {r.status}) until about "
+                                           f"{until}. Redeploy the worker in another region "
+                                           f"(Frankfurt/Singapore) or wait for the ban to expire.", wait)
                         raise TransientError(f"HTTP {r.status} rate limited, retry after {wait:.0f}s")
                     if r.status == 451:
                         raise FatalError("HTTP 451: Binance blocks this server location. "
@@ -1395,9 +1408,29 @@ class Bot:
         await asyncio.gather(stop_wait, *tasks, return_exceptions=True)
 
 
+async def start_health_server(port: int) -> Any:
+    """Optional tiny HTTP endpoint, started ONLY when the PORT env var exists (Render Web Services set it;
+    Background Workers do not). Lets an external pinger keep a free Web Service awake."""
+    from aiohttp import web
+
+    async def ok(_req: Any) -> Any:
+        return web.json_response({"status": "ok", "time": fmt_ts(int(time.time() * 1000))})
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Health endpoint listening on port %d (/ and /health)", port)
+    return runner
+
+
 async def amain() -> int:
     cfg = load_config()
     setup_logging(cfg.log_level)
+    port = os.getenv("PORT", "").strip()
+    health = await start_health_server(int(port)) if port.isdigit() else None  # start before slow backtest
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1411,6 +1444,13 @@ async def amain() -> int:
         code = 0
         try:
             await bot.run()
+        except BanError as exc:
+            log.error("FATAL: %s", exc)
+            await bot.tg.send(f"🛑 <b>Binance IP ban</b>\n{esc(exc)}")
+            idle = min(exc.wait, 3600.0)  # wait before exiting so Render does not restart-loop into the ban
+            log.info("Idling %.0f s before exit to avoid hammering Binance", idle)
+            await _sleep(stop, idle)
+            code = 1
         except FatalError as exc:
             log.error("FATAL: %s", exc)
             await bot.tg.send(f"🛑 <b>Fatal error</b>\n{esc(exc)}")
@@ -1426,6 +1466,8 @@ async def amain() -> int:
         except Exception:
             pass
         log.info("Bye.")
+        if health is not None:
+            await health.cleanup()
         return code
 
 
